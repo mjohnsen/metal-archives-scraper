@@ -19,11 +19,13 @@ def _cfg_float(key: str, default: float) -> float:
 
 # Intervals can be overridden in scraper_config.json, e.g.:
 # {"query_interval_seconds": 12, "query_interval_min": 5}
-QUERY_INTERVAL_SECONDS: float = _cfg_float("query_interval_seconds", 15.0)
+QUERY_INTERVAL_SECONDS: float = _cfg_float("query_interval_seconds", 10.0)
 QUERY_INTERVAL_MIN: float = _cfg_float("query_interval_min", 5.0)
-ARTIST_PAGE_INTERVAL_SECONDS: float = _cfg_float("artist_page_interval_seconds", 10.0)
-ARTIST_PAGE_INTERVAL_MIN: float = _cfg_float("artist_page_interval_min", 5.0)
+ARTIST_PAGE_INTERVAL_SECONDS: float = _cfg_float("artist_page_interval_seconds", 8.0)
+ARTIST_PAGE_INTERVAL_MIN: float = _cfg_float("artist_page_interval_min", 4.0)
 FUZZY_MATCH_THRESHOLD: int = int(_cfg_float("fuzzy_match_threshold", 80))
+# How many artists to process between periodic backups (0 = disabled)
+BACKUP_INTERVAL: int = int(_cfg_float("backup_interval", 25))
 
 
 def save_config(cfg: dict):

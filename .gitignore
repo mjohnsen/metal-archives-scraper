@@ -1,8 +1,8 @@
 .DS_Store
 *.md
 !README.md
-*.xlsx
 scraper_config.json
 .pytest_cache
-logs/
 browser_data/
+logs/
+spreadsheets/

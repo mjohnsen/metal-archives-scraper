@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import shutil
 from pathlib import Path
@@ -45,10 +46,12 @@ _col_map_cache: dict[int, dict[str, int]] = {}
 _row_index_cache: dict[int, dict[tuple[str, str], int]] = {}
 
 COLLECTION_REQUIRED = [C_ARTIST, C_RELEASE]
+# Inserted in this exact order immediately after Artist/Release
+COLLECTION_ORDERED = [C_YEAR, C_GENRE, C_TYPE]
+# Appended (in any order) after the ordered group
 COLLECTION_ADDED = [
     C_MA_ARTIST_URL,
     C_MA_RELEASE_URL,
-    C_TYPE,
     C_SEARCHED,
     C_FOUND,
     C_REVIEW_FLAG,
@@ -105,10 +108,32 @@ def open_workbook(path: str) -> Workbook:
     return wb
 
 
+def _ensure_ordered_columns(ws: Worksheet, column_names: list[str]) -> None:
+    """Insert missing columns in order, each placed right after its predecessor.
+
+    The first column in column_names is positioned immediately after Release.
+    Columns that already exist are not moved; only absent ones are inserted at
+    the correct position relative to their neighbours in column_names.
+    """
+    col_map = _get_col_map(ws)
+    insert_after = col_map.get(C_RELEASE, 2)
+
+    for name in column_names:
+        if name not in col_map:
+            ws.insert_cols(insert_after + 1)
+            ws.cell(row=1, column=insert_after + 1, value=name)
+            _col_map_cache.pop(id(ws), None)
+            _row_index_cache.pop(id(ws), None)
+            col_map = _get_col_map(ws)
+        insert_after = col_map[name]
+
+
 def ensure_collection_sheet(wb: Workbook) -> Worksheet:
     ws = wb.worksheets[0]
     if ws.title != "Collection":
         ws.title = "Collection"
+
+    _ensure_ordered_columns(ws, COLLECTION_ORDERED)
 
     existing_headers = {cell.value for cell in ws[1]}
     for col_name in COLLECTION_ADDED:
@@ -231,12 +256,10 @@ def update_release_row(
         _set(C_MA_ARTIST_URL, artist_url)
     if release_url:
         _set(C_MA_RELEASE_URL, release_url)
-    if release_type:
-        _set(C_TYPE, release_type)
     if needs_review:
         _set(C_REVIEW_FLAG, True)
 
-    # Only populate year/genre when the cell is currently empty
+    # Only populate year/genre/type when the cell is currently empty
     def _set_if_empty(col_name, value):
         col = col_map.get(col_name)
         if col and value:
@@ -252,6 +275,7 @@ def update_release_row(
             pass
     _set_if_empty(C_YEAR, year_val)
     _set_if_empty(C_GENRE, genre)
+    _set_if_empty(C_TYPE, release_type)
 
 
 _DISAMBIG_FIELDS = ("country", "location", "formed_in", "genre", "years_active")
@@ -436,9 +460,15 @@ def add_not_found_entry(ws_not_found: Worksheet, artist_name: str, release_title
 
 
 def save_workbook(wb: Workbook, path: str):
+    # Write to a temp file first, then rename into place atomically.
+    # A same-filesystem rename on POSIX cannot be interrupted mid-write, so
+    # KeyboardInterrupt or a crash during wb.save() leaves the original intact.
+    tmp = str(Path(path).with_suffix(".tmp.xlsx"))
     try:
-        wb.save(path)
+        wb.save(tmp)
+        os.replace(tmp, path)
     except Exception as e:
+        Path(tmp).unlink(missing_ok=True)
         backup = str(Path(path).with_suffix("")) + "_backup.xlsx"
         logger.error("Failed to save workbook to %s: %s. Trying backup: %s", path, e, backup)
         try:

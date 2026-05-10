@@ -26,6 +26,7 @@ from metal_archives_scraper.spreadsheet import (
     COL_REVIEW_MA_URLS,
     COL_REVIEW_RELEASE,
     COLLECTION_ADDED,
+    COLLECTION_ORDERED,
     _compute_disambiguations,
     _col_index,
     _ensure_column,
@@ -168,13 +169,45 @@ class TestEnsureCollectionSheet:
         wb = _wb_with_headers("Artist", "Release")
         ws = ensure_collection_sheet(wb)
         headers = {cell.value for cell in ws[1]}
-        for col_name in COLLECTION_ADDED:
+        for col_name in COLLECTION_ADDED + COLLECTION_ORDERED:
             assert col_name in headers, f"Missing column: {col_name}"
+
+    def test_inserts_year_genre_type_in_order_after_release(self):
+        wb = _wb_with_headers("Artist", "Release")
+        ws = ensure_collection_sheet(wb)
+        headers = [cell.value for cell in ws[1] if cell.value]
+        release_idx = headers.index(C_RELEASE)
+        year_idx = headers.index(C_YEAR)
+        genre_idx = headers.index(C_GENRE)
+        type_idx = headers.index(C_TYPE)
+        assert release_idx < year_idx < genre_idx < type_idx
+
+    def test_inserts_missing_year_before_existing_genre(self):
+        wb = _wb_with_headers("Artist", "Release", C_GENRE)
+        ws = ensure_collection_sheet(wb)
+        headers = [cell.value for cell in ws[1] if cell.value]
+        assert headers.index(C_YEAR) < headers.index(C_GENRE)
+
+    def test_inserts_missing_genre_between_existing_year_and_type(self):
+        wb = _wb_with_headers("Artist", "Release", C_YEAR, C_TYPE)
+        ws = ensure_collection_sheet(wb)
+        headers = [cell.value for cell in ws[1] if cell.value]
+        assert headers.index(C_YEAR) < headers.index(C_GENRE) < headers.index(C_TYPE)
+
+    def test_data_rows_preserved_after_column_insertion(self):
+        wb = _wb_with_headers("Artist", "Release")
+        ws = wb.active
+        ws.cell(row=2, column=1, value="Pharaoh")
+        ws.cell(row=2, column=2, value="After the Fire")
+        ws = ensure_collection_sheet(wb)
+        col_map = _get_col_map(ws)
+        assert ws.cell(row=2, column=col_map[C_ARTIST]).value == "Pharaoh"
+        assert ws.cell(row=2, column=col_map[C_RELEASE]).value == "After the Fire"
 
     def test_does_not_modify_existing_columns(self):
         wb = _wb_with_headers("Artist", "Release", "Year", "Genre")
         ws = ensure_collection_sheet(wb)
-        # Original columns should stay in original positions
+        # Existing columns stay in their original positions
         assert ws.cell(row=1, column=1).value == "Artist"
         assert ws.cell(row=1, column=2).value == "Release"
         assert ws.cell(row=1, column=3).value == "Year"
@@ -187,6 +220,13 @@ class TestEnsureCollectionSheet:
         # C_SEARCHED should appear exactly once
         searched_count = sum(1 for cell in ws[1] if cell.value == C_SEARCHED)
         assert searched_count == 1
+
+    def test_does_not_duplicate_ordered_columns_already_present(self):
+        wb = _wb_with_headers("Artist", "Release", C_YEAR, C_GENRE, C_TYPE)
+        ws = ensure_collection_sheet(wb)
+        headers = [cell.value for cell in ws[1] if cell.value]
+        for col_name in COLLECTION_ORDERED:
+            assert headers.count(col_name) == 1, f"Duplicate column: {col_name}"
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +437,17 @@ class TestUpdateReleaseRow:
         update_release_row(ws, "Pharaoh", "After the Fire",
                            searched=True, found=True, needs_review=True)
         assert _col_val(ws, 2, C_REVIEW_FLAG) is True
+
+    def test_does_not_overwrite_existing_type(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_TYPE, C_SEARCHED, C_FOUND)
+        ws = wb.active
+        ws.cell(row=2, column=1, value="Pharaoh")
+        ws.cell(row=2, column=2, value="After the Fire")
+        ws.cell(row=2, column=3, value="EP")
+
+        update_release_row(ws, "Pharaoh", "After the Fire",
+                           searched=True, found=True, release_type="Full-length")
+        assert _col_val(ws, 2, C_TYPE) == "EP"
 
     def test_does_not_overwrite_existing_year(self):
         ws = self._make_ws()  # row 2 already has year=2008
@@ -757,13 +808,45 @@ class TestSaveWorkbook:
         save_workbook(wb, path)
         assert (tmp_path / "output.xlsx").exists()
 
+    def test_no_tmp_file_left_after_successful_save(self, tmp_path):
+        wb = Workbook()
+        wb.active["A1"] = "test"
+        path = str(tmp_path / "output.xlsx")
+        save_workbook(wb, path)
+        assert not (tmp_path / "output.tmp.xlsx").exists()
+
+    def test_original_file_preserved_when_write_fails(self, tmp_path):
+        # Pre-write a valid spreadsheet so there is an "original" to preserve.
+        from openpyxl import load_workbook
+        original = Workbook()
+        original.active["A1"] = "original"
+        path = str(tmp_path / "output.xlsx")
+        original.save(path)
+
+        from unittest.mock import MagicMock
+        bad_wb = MagicMock()
+        bad_wb.save.side_effect = [PermissionError("locked"), None]  # primary fails, backup succeeds
+        save_workbook(bad_wb, path)
+
+        # Original file must still be intact and readable.
+        loaded = load_workbook(path)
+        assert loaded.active["A1"].value == "original"
+
+    def test_tmp_file_removed_on_write_failure(self, tmp_path):
+        from unittest.mock import MagicMock
+        wb = MagicMock()
+        wb.save.side_effect = [PermissionError("locked"), None]
+        path = str(tmp_path / "output.xlsx")
+        save_workbook(wb, path)
+        assert not (tmp_path / "output.tmp.xlsx").exists()
+
     def test_uses_backup_path_on_primary_failure(self, tmp_path):
         from unittest.mock import MagicMock
         wb = MagicMock()
         wb.save.side_effect = [PermissionError("locked"), None]
         path = str(tmp_path / "output.xlsx")
         save_workbook(wb, path)
-        # save called twice: once for primary, once for backup
+        # save called twice: once for tmp (primary), once for backup
         assert wb.save.call_count == 2
         backup_path = wb.save.call_args_list[1][0][0]
         assert "backup" in backup_path

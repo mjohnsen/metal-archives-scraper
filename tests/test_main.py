@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, call, patch
 from openpyxl import Workbook
 
 # Import the functions under test directly
-from main import AdaptiveThrottle, _apply_artist_match, _fetch_artist_pages, _pick_best_by_type, _process_artist
+from main import AdaptiveThrottle, _apply_artist_match, _fetch_artist_pages, _pick_best_by_type, _process_artist, _save_periodic_backup
 
 import metal_archives_scraper.spreadsheet as spreadsheet_module
 import metal_archives_scraper.scraper as scraper_module
@@ -652,3 +652,39 @@ class TestProcessArtist:
             artist_throttle=_make_throttle(),
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _save_periodic_backup
+# ---------------------------------------------------------------------------
+
+class TestSavePeriodicBackup:
+    def test_creates_backup_in_backups_subdirectory(self, tmp_path):
+        src = tmp_path / "collection.xlsx"
+        src.write_bytes(b"fake xlsx content")
+        _save_periodic_backup(str(src))
+        backup_dir = tmp_path / "backups"
+        assert backup_dir.is_dir()
+        backups = list(backup_dir.glob("collection_*.xlsx"))
+        assert len(backups) == 1
+
+    def test_backup_filename_contains_timestamp(self, tmp_path):
+        src = tmp_path / "collection.xlsx"
+        src.write_bytes(b"fake xlsx content")
+        _save_periodic_backup(str(src))
+        backup_dir = tmp_path / "backups"
+        names = [f.name for f in backup_dir.glob("collection_*.xlsx")]
+        # Timestamp format: YYYYMMDD_HHMMSS
+        import re
+        assert any(re.search(r"collection_\d{8}_\d{6}\.xlsx", n) for n in names)
+
+    def test_backup_content_matches_source(self, tmp_path):
+        src = tmp_path / "collection.xlsx"
+        src.write_bytes(b"hello world")
+        _save_periodic_backup(str(src))
+        backup = next((tmp_path / "backups").glob("collection_*.xlsx"))
+        assert backup.read_bytes() == b"hello world"
+
+    def test_does_not_raise_when_source_missing(self, tmp_path):
+        # Should log a warning but not propagate the exception.
+        _save_periodic_backup(str(tmp_path / "nonexistent.xlsx"))
