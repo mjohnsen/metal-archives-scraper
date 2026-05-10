@@ -1,0 +1,6 @@
+playwright
+openpyxl
+thefuzz
+python-Levenshtein
+beautifulsoup4
+lxml
