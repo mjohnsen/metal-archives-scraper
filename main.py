@@ -7,6 +7,7 @@ import random
 import shutil
 import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from metal_archives_scraper import browser, scraper, spreadsheet
@@ -25,7 +26,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / "scraper.log"),
+        RotatingFileHandler(LOG_DIR / "scraper.log", maxBytes=5_000_000, backupCount=3),
         logging.StreamHandler(),
     ],
 )
