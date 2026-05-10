@@ -5,10 +5,13 @@ import logging
 import os
 import random
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 import openpyxl
 from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 logger = logging.getLogger(__name__)
@@ -38,6 +41,9 @@ COL_REVIEW_MA_URLS = "Metal Archives URLs"
 
 COL_NOT_FOUND_ARTIST = "Artist"
 COL_NOT_FOUND_RELEASE = "Release"
+
+STATS_SHEET = "Statistics"
+_STATS_MAX_ROWS = 50000
 
 # Caches keyed by id(worksheet). Cleared between test runs via conftest fixture.
 # In production a worksheet object lives for the entire session, so these are
@@ -459,7 +465,110 @@ def add_not_found_entry(ws_not_found: Worksheet, artist_name: str, release_title
     _set(COL_NOT_FOUND_RELEASE, release_title)
 
 
+def update_stats_sheet(wb: Workbook) -> None:
+    """Rebuild the Statistics sheet with Excel 365 formulas derived from the other sheets."""
+    if "Collection" not in wb.sheetnames:
+        return
+
+    ws_col = wb["Collection"]
+    col = _get_col_map(ws_col)
+
+    def _cl(c):
+        n = col.get(c)
+        return get_column_letter(n) if n else None
+
+    a = _cl(C_ARTIST)
+    r = _cl(C_RELEASE)
+    y = _cl(C_YEAR)
+    g = _cl(C_GENRE)
+    t = _cl(C_TYPE)
+    s = _cl(C_SEARCHED)
+    f = _cl(C_FOUND)
+    N = _STATS_MAX_ROWS
+
+    def _unique_count(letter):
+        rng = f"Collection!{letter}2:{letter}{N}"
+        return f'=IFERROR(SUMPRODUCT(({rng}<>"")/COUNTIF({rng},{rng}&"")),0)'
+
+    def _countif_col(letter, value):
+        return f"=COUNTIF(Collection!{letter}:{letter},{value})" if letter else 0
+
+    def _counta_col(letter):
+        return f"=COUNTA(Collection!{letter}:{letter})-1" if letter else 0
+
+    def _counta_range(letter):
+        return f"=COUNTA(Collection!{letter}2:{letter}{N})" if letter else 0
+
+    completion = (
+        f'=IFERROR(COUNTIF(Collection!{s}:{s},TRUE)/(COUNTA(Collection!{r}:{r})-1),0)'
+        if s and r else 0
+    )
+    found_rate = (
+        f'=IFERROR(COUNTIF(Collection!{f}:{f},TRUE)/COUNTIF(Collection!{s}:{s},TRUE),0)'
+        if f and s else 0
+    )
+
+    TYPES = ["Full-length", "EP", "Single", "Live album", "Compilation", "Demo"]
+
+    # Each entry: (label, value, bold_label, pct_format)
+    rows_spec: list[tuple] = [
+        ("Metal Archives Collection Statistics", None, True, False),
+        (None, None, False, False),
+        ("Collection", None, True, False),
+        ("Total Releases",   _counta_col(r),           False, False),
+        ("Unique Artists",   _unique_count(a) if a else 0, False, False),
+        ("Searched",         _countif_col(s, "TRUE"),   False, False),
+        ("Found",            _countif_col(f, "TRUE"),   False, False),
+        ("Completion",       completion,                False, True),
+        ("Found Rate",       found_rate,                False, True),
+        (None, None, False, False),
+        ("Release Types", None, True, False),
+        *[(tp, f'=COUNTIF(Collection!{t}:{t},"{tp}")' if t else 0, False, False)
+          for tp in TYPES],
+        (None, None, False, False),
+        ("Metadata", None, True, False),
+        ("With Year",      _counta_range(y), False, False),
+        ("With Genre",     _counta_range(g), False, False),
+        ("Unique Genres",  _unique_count(g) if g else 0, False, False),
+        (None, None, False, False),
+        ("Other Sheets", None, True, False),
+        ("Artists Processed",
+            "=COUNTA(Artists!A:A)-1" if "Artists" in wb.sheetnames else 0,
+            False, False),
+        ("Requiring Review",
+            "=COUNTA(Review!A:A)-1" if "Review" in wb.sheetnames else 0,
+            False, False),
+        ("Not Found",
+            "=COUNTA('Not Found'!A:A)-1" if "Not Found" in wb.sheetnames else 0,
+            False, False),
+        (None, None, False, False),
+        ("Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), False, False),
+    ]
+
+    if STATS_SHEET in wb.sheetnames:
+        del wb[STATS_SHEET]
+    ws = wb.create_sheet(STATS_SHEET)
+
+    bold_font = Font(bold=True)
+    title_font = Font(bold=True, size=13)
+
+    for row_num, (label, value, is_bold, is_pct) in enumerate(rows_spec, start=1):
+        if label is None:
+            ws.append([])
+            continue
+        ws.append([label] if value is None else [label, value])
+        if is_bold:
+            ws.cell(row=row_num, column=1).font = bold_font
+        if is_pct and value:
+            ws.cell(row=row_num, column=2).number_format = "0.0%"
+
+    ws.cell(row=1, column=1).font = title_font
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 16
+
+
 def save_workbook(wb: Workbook, path: str):
+    update_stats_sheet(wb)
     # Write to a temp file first, then rename into place atomically.
     # A same-filesystem rename on POSIX cannot be interrupted mid-write, so
     # KeyboardInterrupt or a crash during wb.save() leaves the original intact.

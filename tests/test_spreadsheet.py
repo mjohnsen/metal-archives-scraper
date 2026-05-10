@@ -27,6 +27,7 @@ from metal_archives_scraper.spreadsheet import (
     COL_REVIEW_RELEASE,
     COLLECTION_ADDED,
     COLLECTION_ORDERED,
+    STATS_SHEET,
     _compute_disambiguations,
     _col_index,
     _ensure_column,
@@ -44,6 +45,7 @@ from metal_archives_scraper.spreadsheet import (
     save_workbook,
     update_artist_row,
     update_release_row,
+    update_stats_sheet,
 )
 
 
@@ -858,3 +860,86 @@ class TestSaveWorkbook:
         path = str(tmp_path / "output.xlsx")
         with pytest.raises(PermissionError):
             save_workbook(wb, path)
+
+
+# ---------------------------------------------------------------------------
+# update_stats_sheet
+# ---------------------------------------------------------------------------
+
+class TestUpdateStatsSheet:
+    def _make_full_wb(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_YEAR, C_GENRE, C_TYPE,
+                              C_SEARCHED, C_FOUND, C_REVIEW_FLAG)
+        ensure_collection_sheet(wb)
+        ensure_artists_sheet(wb)
+        ensure_review_sheet(wb)
+        ensure_not_found_sheet(wb)
+        return wb
+
+    def test_creates_statistics_sheet(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        assert STATS_SHEET in wb.sheetnames
+
+    def test_does_nothing_without_collection_sheet(self):
+        wb = Workbook()
+        wb.active.title = "NotCollection"
+        update_stats_sheet(wb)
+        assert STATS_SHEET not in wb.sheetnames
+
+    def test_idempotent_does_not_duplicate_sheet(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        update_stats_sheet(wb)
+        assert wb.sheetnames.count(STATS_SHEET) == 1
+
+    def test_expected_labels_present(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        ws = wb[STATS_SHEET]
+        labels = {ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)}
+        for expected in [
+            "Collection", "Release Types", "Metadata", "Other Sheets",
+            "Total Releases", "Unique Artists", "Searched", "Found",
+            "Completion", "Found Rate", "With Year", "With Genre", "Unique Genres",
+            "Artists Processed", "Requiring Review", "Not Found", "Last Updated",
+        ]:
+            assert expected in labels, f"Missing label: {expected}"
+
+    def test_completion_and_found_rate_have_pct_format(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        ws = wb[STATS_SHEET]
+        pct_rows = [
+            r for r in range(1, ws.max_row + 1)
+            if ws.cell(row=r, column=1).value in ("Completion", "Found Rate")
+        ]
+        assert len(pct_rows) == 2
+        for row in pct_rows:
+            assert "%" in ws.cell(row=row, column=2).number_format
+
+    def test_value_formulas_reference_collection(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        ws = wb[STATS_SHEET]
+        formulas = [
+            ws.cell(row=r, column=2).value
+            for r in range(1, ws.max_row + 1)
+            if isinstance(ws.cell(row=r, column=2).value, str)
+            and ws.cell(row=r, column=2).value.startswith("=")
+        ]
+        assert any("Collection" in f for f in formulas)
+
+    def test_last_updated_is_static_string(self):
+        from datetime import datetime as _dt
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        ws = wb[STATS_SHEET]
+        val = next(
+            (ws.cell(row=r, column=2).value
+             for r in range(1, ws.max_row + 1)
+             if ws.cell(row=r, column=1).value == "Last Updated"),
+            None,
+        )
+        assert val is not None
+        _dt.strptime(val, "%Y-%m-%d %H:%M:%S")  # raises if format is wrong
