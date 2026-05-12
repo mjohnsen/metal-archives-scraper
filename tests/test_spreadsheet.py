@@ -26,6 +26,8 @@ from metal_archives_scraper.spreadsheet import (
     COL_REVIEW_MA_URLS,
     COL_REVIEW_RELEASE,
     COLLECTION_ADDED,
+    COLLECTION_ORDERED,
+    STATS_SHEET,
     _compute_disambiguations,
     _col_index,
     _ensure_column,
@@ -37,12 +39,14 @@ from metal_archives_scraper.spreadsheet import (
     ensure_not_found_sheet,
     ensure_review_sheet,
     expand_st_titles,
+    find_duplicate_rows,
     get_unsearched_artists,
     open_workbook,
     pick_random_artist,
     save_workbook,
     update_artist_row,
     update_release_row,
+    update_stats_sheet,
 )
 
 
@@ -168,13 +172,45 @@ class TestEnsureCollectionSheet:
         wb = _wb_with_headers("Artist", "Release")
         ws = ensure_collection_sheet(wb)
         headers = {cell.value for cell in ws[1]}
-        for col_name in COLLECTION_ADDED:
+        for col_name in COLLECTION_ADDED + COLLECTION_ORDERED:
             assert col_name in headers, f"Missing column: {col_name}"
+
+    def test_inserts_year_genre_type_in_order_after_release(self):
+        wb = _wb_with_headers("Artist", "Release")
+        ws = ensure_collection_sheet(wb)
+        headers = [cell.value for cell in ws[1] if cell.value]
+        release_idx = headers.index(C_RELEASE)
+        year_idx = headers.index(C_YEAR)
+        genre_idx = headers.index(C_GENRE)
+        type_idx = headers.index(C_TYPE)
+        assert release_idx < year_idx < genre_idx < type_idx
+
+    def test_inserts_missing_year_before_existing_genre(self):
+        wb = _wb_with_headers("Artist", "Release", C_GENRE)
+        ws = ensure_collection_sheet(wb)
+        headers = [cell.value for cell in ws[1] if cell.value]
+        assert headers.index(C_YEAR) < headers.index(C_GENRE)
+
+    def test_inserts_missing_genre_between_existing_year_and_type(self):
+        wb = _wb_with_headers("Artist", "Release", C_YEAR, C_TYPE)
+        ws = ensure_collection_sheet(wb)
+        headers = [cell.value for cell in ws[1] if cell.value]
+        assert headers.index(C_YEAR) < headers.index(C_GENRE) < headers.index(C_TYPE)
+
+    def test_data_rows_preserved_after_column_insertion(self):
+        wb = _wb_with_headers("Artist", "Release")
+        ws = wb.active
+        ws.cell(row=2, column=1, value="Pharaoh")
+        ws.cell(row=2, column=2, value="After the Fire")
+        ws = ensure_collection_sheet(wb)
+        col_map = _get_col_map(ws)
+        assert ws.cell(row=2, column=col_map[C_ARTIST]).value == "Pharaoh"
+        assert ws.cell(row=2, column=col_map[C_RELEASE]).value == "After the Fire"
 
     def test_does_not_modify_existing_columns(self):
         wb = _wb_with_headers("Artist", "Release", "Year", "Genre")
         ws = ensure_collection_sheet(wb)
-        # Original columns should stay in original positions
+        # Existing columns stay in their original positions
         assert ws.cell(row=1, column=1).value == "Artist"
         assert ws.cell(row=1, column=2).value == "Release"
         assert ws.cell(row=1, column=3).value == "Year"
@@ -187,6 +223,13 @@ class TestEnsureCollectionSheet:
         # C_SEARCHED should appear exactly once
         searched_count = sum(1 for cell in ws[1] if cell.value == C_SEARCHED)
         assert searched_count == 1
+
+    def test_does_not_duplicate_ordered_columns_already_present(self):
+        wb = _wb_with_headers("Artist", "Release", C_YEAR, C_GENRE, C_TYPE)
+        ws = ensure_collection_sheet(wb)
+        headers = [cell.value for cell in ws[1] if cell.value]
+        for col_name in COLLECTION_ORDERED:
+            assert headers.count(col_name) == 1, f"Duplicate column: {col_name}"
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +394,80 @@ class TestPickRandomArtist:
 
 
 # ---------------------------------------------------------------------------
+# find_duplicate_rows
+# ---------------------------------------------------------------------------
+
+class TestFindDuplicateRows:
+    def _make_ws(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_SEARCHED)
+        ws = wb.active
+        ws.cell(row=2, column=1, value="Pharaoh")
+        ws.cell(row=2, column=2, value="After the Fire")
+        ws.cell(row=3, column=1, value="Iced Earth")
+        ws.cell(row=3, column=2, value="Framing Armageddon")
+        return ws
+
+    def test_returns_empty_when_no_duplicates(self):
+        ws = self._make_ws()
+        assert find_duplicate_rows(ws) == []
+
+    def test_detects_duplicate_pair(self):
+        ws = self._make_ws()
+        ws.cell(row=4, column=1, value="Pharaoh")
+        ws.cell(row=4, column=2, value="After the Fire")
+        dupes = find_duplicate_rows(ws)
+        assert len(dupes) == 1
+        artist, release, rows = dupes[0]
+        assert artist == "Pharaoh"
+        assert release == "After the Fire"
+        assert sorted(rows) == [2, 4]
+
+    def test_reports_all_row_numbers_for_triplicate(self):
+        ws = self._make_ws()
+        ws.cell(row=4, column=1, value="Pharaoh")
+        ws.cell(row=4, column=2, value="After the Fire")
+        ws.cell(row=5, column=1, value="Pharaoh")
+        ws.cell(row=5, column=2, value="After the Fire")
+        artist, release, rows = find_duplicate_rows(ws)[0]
+        assert sorted(rows) == [2, 4, 5]
+
+    def test_does_not_flag_same_artist_different_release(self):
+        ws = self._make_ws()
+        ws.cell(row=4, column=1, value="Pharaoh")
+        ws.cell(row=4, column=2, value="The Longest Night")
+        assert find_duplicate_rows(ws) == []
+
+    def test_result_is_sorted_by_artist_then_release(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE)
+        ws = wb.active
+        for r, (a, rel) in enumerate([
+            ("Iced Earth", "Framing Armageddon"),
+            ("Pharaoh", "After the Fire"),
+            ("Iced Earth", "Framing Armageddon"),
+            ("Pharaoh", "After the Fire"),
+        ], start=2):
+            ws.cell(row=r, column=1, value=a)
+            ws.cell(row=r, column=2, value=rel)
+        dupes = find_duplicate_rows(ws)
+        assert [d[0] for d in dupes] == ["Iced Earth", "Pharaoh"]
+
+    def test_sort_is_case_insensitive(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE)
+        ws = wb.active
+        for r, (a, rel) in enumerate([
+            ("zz Top", "Eliminator"),
+            ("Accept", "Balls to the Wall"),
+            ("zz Top", "Eliminator"),
+            ("Accept", "Balls to the Wall"),
+        ], start=2):
+            ws.cell(row=r, column=1, value=a)
+            ws.cell(row=r, column=2, value=rel)
+        dupes = find_duplicate_rows(ws)
+        assert dupes[0][0] == "Accept"
+        assert dupes[1][0] == "zz Top"
+
+
+# ---------------------------------------------------------------------------
 # update_release_row
 # ---------------------------------------------------------------------------
 
@@ -397,6 +514,17 @@ class TestUpdateReleaseRow:
         update_release_row(ws, "Pharaoh", "After the Fire",
                            searched=True, found=True, needs_review=True)
         assert _col_val(ws, 2, C_REVIEW_FLAG) is True
+
+    def test_does_not_overwrite_existing_type(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_TYPE, C_SEARCHED, C_FOUND)
+        ws = wb.active
+        ws.cell(row=2, column=1, value="Pharaoh")
+        ws.cell(row=2, column=2, value="After the Fire")
+        ws.cell(row=2, column=3, value="EP")
+
+        update_release_row(ws, "Pharaoh", "After the Fire",
+                           searched=True, found=True, release_type="Full-length")
+        assert _col_val(ws, 2, C_TYPE) == "EP"
 
     def test_does_not_overwrite_existing_year(self):
         ws = self._make_ws()  # row 2 already has year=2008
@@ -453,6 +581,43 @@ class TestUpdateReleaseRow:
         ws = self._make_ws()
         # Should not raise
         update_release_row(ws, "Nonexistent", "Album", searched=True, found=False)
+
+    def test_updates_unsearched_duplicate_when_later_row_is_already_searched(self):
+        # Regression: _get_row_index used a dict with last-row-wins semantics.
+        # If an already-searched duplicate appeared after the unsearched row,
+        # update_release_row would write to the searched row (no-op) and leave
+        # the unsearched duplicate permanently stuck.
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_SEARCHED, C_FOUND)
+        ws = wb.active
+        # Row 2: unsearched duplicate (the one that must be updated)
+        ws.cell(row=2, column=1, value="Withering Surface")
+        ws.cell(row=2, column=2, value="Exit Plan")
+        # Row 3: already-searched duplicate (appears later — was the last-wins target)
+        ws.cell(row=3, column=1, value="Withering Surface")
+        ws.cell(row=3, column=2, value="Exit Plan")
+        ws.cell(row=3, column=3, value=True)   # Searched
+        ws.cell(row=3, column=4, value=True)   # Found
+
+        update_release_row(ws, "Withering Surface", "Exit Plan", searched=True, found=False)
+
+        assert ws.cell(row=2, column=3).value is True, (
+            "Unsearched duplicate (row 2) was not marked — update went to the already-searched row instead"
+        )
+
+    def test_updates_all_unsearched_duplicates(self):
+        # When every duplicate is unsearched, all of them must be marked so
+        # none remain visible to get_unsearched_artists.
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_SEARCHED, C_FOUND)
+        ws = wb.active
+        ws.cell(row=2, column=1, value="Withering Surface")
+        ws.cell(row=2, column=2, value="Exit Plan")
+        ws.cell(row=3, column=1, value="Withering Surface")
+        ws.cell(row=3, column=2, value="Exit Plan")
+
+        update_release_row(ws, "Withering Surface", "Exit Plan", searched=True, found=False)
+
+        assert ws.cell(row=2, column=3).value is True
+        assert ws.cell(row=3, column=3).value is True
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +881,47 @@ class TestExpandStTitles:
         # Other Band's row should be untouched
         assert ws_collection.cell(row=3, column=2).value == "s/t"
 
+    def test_update_release_row_works_after_st_rename_with_stale_cache(self):
+        # Regression: expand_st_titles modifies the Release cell without
+        # invalidating _row_index_cache. A second artist with s/t could have
+        # its cache entry built under ("Artist", "s/t") before the rename,
+        # so the subsequent update_release_row("Artist", "Artist") lookup
+        # would miss and silently skip writing the Searched flag — causing
+        # the artist to loop forever as "unsearched".
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_SEARCHED, C_FOUND)
+        ws_collection = wb.active
+        # Artist 1 (non-s/t) — processed first, which populates the cache
+        ws_collection.cell(row=2, column=1, value="Pharaoh")
+        ws_collection.cell(row=2, column=2, value="After the Fire")
+        # Artist 2 (s/t) — cache is built before expand_st_titles renames it
+        ws_collection.cell(row=3, column=1, value="Black Funeral")
+        ws_collection.cell(row=3, column=2, value="s/t")
+
+        wb.create_sheet("Review")
+        ws_review = wb["Review"]
+        for i, col in enumerate(
+            [COL_REVIEW_ARTIST, COL_REVIEW_RELEASE, COL_REVIEW_ISSUE, COL_REVIEW_MA_URLS],
+            start=1,
+        ):
+            ws_review.cell(row=1, column=i, value=col)
+
+        # Trigger cache build (simulates first artist's update_release_row)
+        update_release_row(ws_collection, "Pharaoh", "After the Fire",
+                           searched=True, found=True)
+
+        # Now expand s/t for artist 2 — this renames the cell and must clear the cache
+        expand_st_titles(ws_collection, ws_review, "Black Funeral", ["s/t"])
+
+        # update_release_row must find the row even though cache was stale
+        update_release_row(ws_collection, "Black Funeral", "Black Funeral",
+                           searched=True, found=False)
+
+        searched = _col_val(ws_collection, 3, C_SEARCHED)
+        assert searched is True, (
+            "Searched flag was not written — expand_st_titles likely failed to "
+            "invalidate _row_index_cache after renaming the s/t cell"
+        )
+
 
 # ---------------------------------------------------------------------------
 # add_not_found_entry
@@ -757,13 +963,45 @@ class TestSaveWorkbook:
         save_workbook(wb, path)
         assert (tmp_path / "output.xlsx").exists()
 
+    def test_no_tmp_file_left_after_successful_save(self, tmp_path):
+        wb = Workbook()
+        wb.active["A1"] = "test"
+        path = str(tmp_path / "output.xlsx")
+        save_workbook(wb, path)
+        assert not (tmp_path / "output.tmp.xlsx").exists()
+
+    def test_original_file_preserved_when_write_fails(self, tmp_path):
+        # Pre-write a valid spreadsheet so there is an "original" to preserve.
+        from openpyxl import load_workbook
+        original = Workbook()
+        original.active["A1"] = "original"
+        path = str(tmp_path / "output.xlsx")
+        original.save(path)
+
+        from unittest.mock import MagicMock
+        bad_wb = MagicMock()
+        bad_wb.save.side_effect = [PermissionError("locked"), None]  # primary fails, backup succeeds
+        save_workbook(bad_wb, path)
+
+        # Original file must still be intact and readable.
+        loaded = load_workbook(path)
+        assert loaded.active["A1"].value == "original"
+
+    def test_tmp_file_removed_on_write_failure(self, tmp_path):
+        from unittest.mock import MagicMock
+        wb = MagicMock()
+        wb.save.side_effect = [PermissionError("locked"), None]
+        path = str(tmp_path / "output.xlsx")
+        save_workbook(wb, path)
+        assert not (tmp_path / "output.tmp.xlsx").exists()
+
     def test_uses_backup_path_on_primary_failure(self, tmp_path):
         from unittest.mock import MagicMock
         wb = MagicMock()
         wb.save.side_effect = [PermissionError("locked"), None]
         path = str(tmp_path / "output.xlsx")
         save_workbook(wb, path)
-        # save called twice: once for primary, once for backup
+        # save called twice: once for tmp (primary), once for backup
         assert wb.save.call_count == 2
         backup_path = wb.save.call_args_list[1][0][0]
         assert "backup" in backup_path
@@ -775,3 +1013,86 @@ class TestSaveWorkbook:
         path = str(tmp_path / "output.xlsx")
         with pytest.raises(PermissionError):
             save_workbook(wb, path)
+
+
+# ---------------------------------------------------------------------------
+# update_stats_sheet
+# ---------------------------------------------------------------------------
+
+class TestUpdateStatsSheet:
+    def _make_full_wb(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_YEAR, C_GENRE, C_TYPE,
+                              C_SEARCHED, C_FOUND, C_REVIEW_FLAG)
+        ensure_collection_sheet(wb)
+        ensure_artists_sheet(wb)
+        ensure_review_sheet(wb)
+        ensure_not_found_sheet(wb)
+        return wb
+
+    def test_creates_statistics_sheet(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        assert STATS_SHEET in wb.sheetnames
+
+    def test_does_nothing_without_collection_sheet(self):
+        wb = Workbook()
+        wb.active.title = "NotCollection"
+        update_stats_sheet(wb)
+        assert STATS_SHEET not in wb.sheetnames
+
+    def test_idempotent_does_not_duplicate_sheet(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        update_stats_sheet(wb)
+        assert wb.sheetnames.count(STATS_SHEET) == 1
+
+    def test_expected_labels_present(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        ws = wb[STATS_SHEET]
+        labels = {ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)}
+        for expected in [
+            "Collection", "Release Types", "Metadata", "Other Sheets",
+            "Total Releases", "Unique Artists", "Searched", "Found",
+            "Completion", "Found Rate", "With Year", "With Genre", "Unique Genres",
+            "Artists Processed", "Requiring Review", "Not Found", "Last Updated",
+        ]:
+            assert expected in labels, f"Missing label: {expected}"
+
+    def test_completion_and_found_rate_have_pct_format(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        ws = wb[STATS_SHEET]
+        pct_rows = [
+            r for r in range(1, ws.max_row + 1)
+            if ws.cell(row=r, column=1).value in ("Completion", "Found Rate")
+        ]
+        assert len(pct_rows) == 2
+        for row in pct_rows:
+            assert "%" in ws.cell(row=row, column=2).number_format
+
+    def test_value_formulas_reference_collection(self):
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        ws = wb[STATS_SHEET]
+        formulas = [
+            ws.cell(row=r, column=2).value
+            for r in range(1, ws.max_row + 1)
+            if isinstance(ws.cell(row=r, column=2).value, str)
+            and ws.cell(row=r, column=2).value.startswith("=")
+        ]
+        assert any("Collection" in f for f in formulas)
+
+    def test_last_updated_is_static_string(self):
+        from datetime import datetime as _dt
+        wb = self._make_full_wb()
+        update_stats_sheet(wb)
+        ws = wb[STATS_SHEET]
+        val = next(
+            (ws.cell(row=r, column=2).value
+             for r in range(1, ws.max_row + 1)
+             if ws.cell(row=r, column=1).value == "Last Updated"),
+            None,
+        )
+        assert val is not None
+        _dt.strptime(val, "%Y-%m-%d %H:%M:%S")  # raises if format is wrong

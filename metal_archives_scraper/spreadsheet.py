@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 import openpyxl
 from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 logger = logging.getLogger(__name__)
@@ -38,17 +42,22 @@ COL_REVIEW_MA_URLS = "Metal Archives URLs"
 COL_NOT_FOUND_ARTIST = "Artist"
 COL_NOT_FOUND_RELEASE = "Release"
 
+STATS_SHEET = "Statistics"
+_STATS_MAX_ROWS = 50000
+
 # Caches keyed by id(worksheet). Cleared between test runs via conftest fixture.
 # In production a worksheet object lives for the entire session, so these are
 # populated once and never stale.
 _col_map_cache: dict[int, dict[str, int]] = {}
-_row_index_cache: dict[int, dict[tuple[str, str], int]] = {}
+_row_index_cache: dict[int, dict[tuple[str, str], list[int]]] = {}
 
 COLLECTION_REQUIRED = [C_ARTIST, C_RELEASE]
+# Inserted in this exact order immediately after Artist/Release
+COLLECTION_ORDERED = [C_YEAR, C_GENRE, C_TYPE]
+# Appended (in any order) after the ordered group
 COLLECTION_ADDED = [
     C_MA_ARTIST_URL,
     C_MA_RELEASE_URL,
-    C_TYPE,
     C_SEARCHED,
     C_FOUND,
     C_REVIEW_FLAG,
@@ -78,19 +87,19 @@ def _get_col_map(ws: Worksheet) -> dict[str, int]:
     return _col_map_cache[ws_id]
 
 
-def _get_row_index(ws: Worksheet) -> dict[tuple[str, str], int]:
+def _get_row_index(ws: Worksheet) -> dict[tuple[str, str], list[int]]:
     ws_id = id(ws)
     if ws_id not in _row_index_cache:
         col_map = _get_col_map(ws)
         artist_col = col_map.get(C_ARTIST)
         release_col = col_map.get(C_RELEASE)
-        index: dict[tuple[str, str], int] = {}
+        index: dict[tuple[str, str], list[int]] = {}
         if artist_col and release_col:
             for row in ws.iter_rows(min_row=2):
                 artist = row[artist_col - 1].value
                 release = row[release_col - 1].value
                 if artist and release:
-                    index[(str(artist), str(release))] = row[0].row
+                    index.setdefault((str(artist), str(release)), []).append(row[0].row)
         _row_index_cache[ws_id] = index
     return _row_index_cache[ws_id]
 
@@ -105,10 +114,32 @@ def open_workbook(path: str) -> Workbook:
     return wb
 
 
+def _ensure_ordered_columns(ws: Worksheet, column_names: list[str]) -> None:
+    """Insert missing columns in order, each placed right after its predecessor.
+
+    The first column in column_names is positioned immediately after Release.
+    Columns that already exist are not moved; only absent ones are inserted at
+    the correct position relative to their neighbours in column_names.
+    """
+    col_map = _get_col_map(ws)
+    insert_after = col_map.get(C_RELEASE, 2)
+
+    for name in column_names:
+        if name not in col_map:
+            ws.insert_cols(insert_after + 1)
+            ws.cell(row=1, column=insert_after + 1, value=name)
+            _col_map_cache.pop(id(ws), None)
+            _row_index_cache.pop(id(ws), None)
+            col_map = _get_col_map(ws)
+        insert_after = col_map[name]
+
+
 def ensure_collection_sheet(wb: Workbook) -> Worksheet:
     ws = wb.worksheets[0]
     if ws.title != "Collection":
         ws.title = "Collection"
+
+    _ensure_ordered_columns(ws, COLLECTION_ORDERED)
 
     existing_headers = {cell.value for cell in ws[1]}
     for col_name in COLLECTION_ADDED:
@@ -194,6 +225,22 @@ def get_unsearched_artists(ws: Worksheet) -> dict[str, list[str]]:
     return result
 
 
+def find_duplicate_rows(ws: Worksheet) -> list[tuple[str, str, list[int]]]:
+    """Return one entry per (artist, release) pair that appears more than once.
+
+    Each entry is (artist_name, release_title, [row_numbers]), sorted
+    alphabetically by artist then release.
+    """
+    index = _get_row_index(ws)
+    dupes = [
+        (artist, release, rows)
+        for (artist, release), rows in index.items()
+        if len(rows) > 1
+    ]
+    dupes.sort(key=lambda x: (x[0].casefold(), x[1].casefold()))
+    return dupes
+
+
 def pick_random_artist(ws: Worksheet) -> tuple[str, list[str]] | tuple[None, None]:
     unsearched = get_unsearched_artists(ws)
     if not unsearched:
@@ -216,33 +263,9 @@ def update_release_row(
     needs_review: bool = False,
 ):
     col_map = _get_col_map(ws)
-    row_num = _get_row_index(ws).get((artist_name, release_title))
-    if row_num is None:
+    row_nums = _get_row_index(ws).get((artist_name, release_title))
+    if not row_nums:
         return
-
-    def _set(col_name, value):
-        col = col_map.get(col_name)
-        if col and value is not None:
-            ws.cell(row=row_num, column=col, value=value)
-
-    _set(C_SEARCHED, searched)
-    _set(C_FOUND, found)
-    if artist_url:
-        _set(C_MA_ARTIST_URL, artist_url)
-    if release_url:
-        _set(C_MA_RELEASE_URL, release_url)
-    if release_type:
-        _set(C_TYPE, release_type)
-    if needs_review:
-        _set(C_REVIEW_FLAG, True)
-
-    # Only populate year/genre when the cell is currently empty
-    def _set_if_empty(col_name, value):
-        col = col_map.get(col_name)
-        if col and value:
-            cell = ws.cell(row=row_num, column=col)
-            if not cell.value:
-                cell.value = value
 
     year_val = year
     if year:
@@ -250,8 +273,33 @@ def update_release_row(
             year_val = int(year)
         except (ValueError, TypeError):
             pass
-    _set_if_empty(C_YEAR, year_val)
-    _set_if_empty(C_GENRE, genre)
+
+    for row_num in row_nums:
+        def _set(col_name, value, _row=row_num):
+            col = col_map.get(col_name)
+            if col and value is not None:
+                ws.cell(row=_row, column=col, value=value)
+
+        _set(C_SEARCHED, searched)
+        _set(C_FOUND, found)
+        if artist_url:
+            _set(C_MA_ARTIST_URL, artist_url)
+        if release_url:
+            _set(C_MA_RELEASE_URL, release_url)
+        if needs_review:
+            _set(C_REVIEW_FLAG, True)
+
+        # Only populate year/genre/type when the cell is currently empty
+        def _set_if_empty(col_name, value, _row=row_num):
+            col = col_map.get(col_name)
+            if col and value:
+                cell = ws.cell(row=_row, column=col)
+                if not cell.value:
+                    cell.value = value
+
+        _set_if_empty(C_YEAR, year_val)
+        _set_if_empty(C_GENRE, genre)
+        _set_if_empty(C_TYPE, release_type)
 
 
 _DISAMBIG_FIELDS = ("country", "location", "formed_in", "genre", "years_active")
@@ -373,6 +421,7 @@ def expand_st_titles(
     updated: list[str] = []
     for title in release_titles:
         if title.strip().lower() == "s/t":
+            renamed = False
             for row in ws_collection.iter_rows(min_row=2):
                 row_artist = row[artist_col - 1].value if artist_col else None
                 row_release = row[release_col - 1].value if release_col else None
@@ -381,6 +430,9 @@ def expand_st_titles(
                     and str(row_release).strip().lower() == "s/t"
                 ):
                     row[release_col - 1].value = artist_name
+                    renamed = True
+            if renamed:
+                _row_index_cache.pop(id(ws_collection), None)
             add_review_entry(
                 ws_review, artist_name, artist_name,
                 "s/t changed to artist name", [],
@@ -435,10 +487,119 @@ def add_not_found_entry(ws_not_found: Worksheet, artist_name: str, release_title
     _set(COL_NOT_FOUND_RELEASE, release_title)
 
 
+def update_stats_sheet(wb: Workbook) -> None:
+    """Rebuild the Statistics sheet with Excel 365 formulas derived from the other sheets."""
+    if "Collection" not in wb.sheetnames:
+        return
+
+    ws_col = wb["Collection"]
+    col = _get_col_map(ws_col)
+
+    def _cl(c):
+        n = col.get(c)
+        return get_column_letter(n) if n else None
+
+    a = _cl(C_ARTIST)
+    r = _cl(C_RELEASE)
+    y = _cl(C_YEAR)
+    g = _cl(C_GENRE)
+    t = _cl(C_TYPE)
+    s = _cl(C_SEARCHED)
+    f = _cl(C_FOUND)
+    N = _STATS_MAX_ROWS
+
+    def _unique_count(letter):
+        rng = f"Collection!{letter}2:{letter}{N}"
+        return f'=IFERROR(SUMPRODUCT(({rng}<>"")/COUNTIF({rng},{rng}&"")),0)'
+
+    def _countif_col(letter, value):
+        return f"=COUNTIF(Collection!{letter}:{letter},{value})" if letter else 0
+
+    def _counta_col(letter):
+        return f"=COUNTA(Collection!{letter}:{letter})-1" if letter else 0
+
+    def _counta_range(letter):
+        return f"=COUNTA(Collection!{letter}2:{letter}{N})" if letter else 0
+
+    completion = (
+        f'=IFERROR(COUNTIF(Collection!{s}:{s},TRUE)/(COUNTA(Collection!{r}:{r})-1),0)'
+        if s and r else 0
+    )
+    found_rate = (
+        f'=IFERROR(COUNTIF(Collection!{f}:{f},TRUE)/COUNTIF(Collection!{s}:{s},TRUE),0)'
+        if f and s else 0
+    )
+
+    TYPES = ["Full-length", "EP", "Single", "Live album", "Compilation", "Demo"]
+
+    # Each entry: (label, value, bold_label, pct_format)
+    rows_spec: list[tuple] = [
+        ("Metal Archives Collection Statistics", None, True, False),
+        (None, None, False, False),
+        ("Collection", None, True, False),
+        ("Total Releases",   _counta_col(r),           False, False),
+        ("Unique Artists",   _unique_count(a) if a else 0, False, False),
+        ("Searched",         _countif_col(s, "TRUE"),   False, False),
+        ("Found",            _countif_col(f, "TRUE"),   False, False),
+        ("Completion",       completion,                False, True),
+        ("Found Rate",       found_rate,                False, True),
+        (None, None, False, False),
+        ("Release Types", None, True, False),
+        *[(tp, f'=COUNTIF(Collection!{t}:{t},"{tp}")' if t else 0, False, False)
+          for tp in TYPES],
+        (None, None, False, False),
+        ("Metadata", None, True, False),
+        ("With Year",      _counta_range(y), False, False),
+        ("With Genre",     _counta_range(g), False, False),
+        ("Unique Genres",  _unique_count(g) if g else 0, False, False),
+        (None, None, False, False),
+        ("Other Sheets", None, True, False),
+        ("Artists Processed",
+            "=COUNTA(Artists!A:A)-1" if "Artists" in wb.sheetnames else 0,
+            False, False),
+        ("Requiring Review",
+            "=COUNTA(Review!A:A)-1" if "Review" in wb.sheetnames else 0,
+            False, False),
+        ("Not Found",
+            "=COUNTA('Not Found'!A:A)-1" if "Not Found" in wb.sheetnames else 0,
+            False, False),
+        (None, None, False, False),
+        ("Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), False, False),
+    ]
+
+    if STATS_SHEET in wb.sheetnames:
+        del wb[STATS_SHEET]
+    ws = wb.create_sheet(STATS_SHEET)
+
+    bold_font = Font(bold=True)
+    title_font = Font(bold=True, size=13)
+
+    for row_num, (label, value, is_bold, is_pct) in enumerate(rows_spec, start=1):
+        if label is None:
+            ws.append([])
+            continue
+        ws.append([label] if value is None else [label, value])
+        if is_bold:
+            ws.cell(row=row_num, column=1).font = bold_font
+        if is_pct and value:
+            ws.cell(row=row_num, column=2).number_format = "0.0%"
+
+    ws.cell(row=1, column=1).font = title_font
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 16
+
+
 def save_workbook(wb: Workbook, path: str):
+    update_stats_sheet(wb)
+    # Write to a temp file first, then rename into place atomically.
+    # A same-filesystem rename on POSIX cannot be interrupted mid-write, so
+    # KeyboardInterrupt or a crash during wb.save() leaves the original intact.
+    tmp = str(Path(path).with_suffix(".tmp.xlsx"))
     try:
-        wb.save(path)
+        wb.save(tmp)
+        os.replace(tmp, path)
     except Exception as e:
+        Path(tmp).unlink(missing_ok=True)
         backup = str(Path(path).with_suffix("")) + "_backup.xlsx"
         logger.error("Failed to save workbook to %s: %s. Trying backup: %s", path, e, backup)
         try:

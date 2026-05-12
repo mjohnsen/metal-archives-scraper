@@ -47,6 +47,13 @@ pip3 install -r requirements.txt
 playwright install chromium
 ```
 
+On Windows, use `pip` and `python` instead of `pip3`/`python3`, and run the Playwright install step through Python to ensure it uses the right installation:
+
+```bat
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
 ## Running
 
 ```bash
@@ -81,6 +88,31 @@ Optional settings can be set in `scraper_config.json` in the project root:
 
 The rate limiter starts at `*_seconds` and adaptively decreases toward `*_min` after sustained successful requests. `fuzzy_match_threshold` (0–100) controls how closely a release title must match a Metal Archives discography entry to be considered a match. Lower values match more aggressively but increase false positives.
 
+## Utilities
+
+### Finding duplicate rows
+
+If your spreadsheet has the same (Artist, Release) pair on more than one row, the scraper will process it correctly, but you may want to clean up the duplicates manually. Run:
+
+```bash
+python3 main.py --find-duplicates
+```
+
+This scans the collection sheet and prints a report of every duplicate pair and the spreadsheet row numbers where each copy appears, then exits without starting the browser or making any network requests. Example output:
+
+```
+Found 2 duplicate (Artist, Release) pair(s):
+
+  Pharaoh — After the Fire  (rows 142, 3847)
+  Withering Surface — Exit Plan  (rows 89, 10234)
+```
+
+The `--spreadsheet` flag works alongside `--find-duplicates` if you want to check a file other than the one saved in `scraper_config.json`:
+
+```bash
+python3 main.py --spreadsheet /path/to/collection.xlsx --find-duplicates
+```
+
 ## Limitations
 
 **Requires a visible browser.** The scraper cannot run headless. Cloudflare will block headless Chromium, so the browser window must remain open. The persistent browser profile (`browser_data/`) stores cookies and session state across runs, which reduces but does not eliminate Cloudflare challenges.
@@ -94,3 +126,7 @@ The rate limiter starts at `*_seconds` and adaptively decreases toward `*_min` a
 **Single-threaded, single-browser.** Requests are made sequentially through one browser page. There is no parallelism. For large collections this is slow by design — Metal Archives rate-limits aggressively.
 
 **No proxy or IP rotation support.** If Cloudflare blocks your IP entirely, the script will time out on every challenge. The only remedies are waiting, switching networks, or clearing the browser profile and re-establishing a session.
+
+## Why this exists
+
+This is a purpose-built utility to add genre and release year to the spreadsheet that documents my friend's legendary collection of metal CDs.  I undertook the project in the spirit of mutal assistance and as an excercise in vibe coding.  Although I have been a professional software engineer for three decades, this was my first significant foray into AI-assisted coding and certainly the first software I've made relying primarily on an agent.  I have worked with Python occasionally in my career, but it is not a language I know well, so I can't even really appraise the quality of this code.  In fact, I did not write any of the code in this project - it was entirely authored by Claude Sonnet 4.6 - but I had a lot of fun making the plan, writing the prompts, and "collaborating" with the technology that will inevitably enslave us all, and with which I formed an alarmingly instant pseudosocial relationship.  I didn't even write the git commit messages, but at the very least, these parting words are all mine.

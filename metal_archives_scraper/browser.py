@@ -23,7 +23,10 @@ def launch_browser() -> BrowserContext:
     _context = _playwright.chromium.launch_persistent_context(
         user_data_dir=_USER_DATA_DIR,
         headless=False,
-        args=["--disable-blink-features=AutomationControlled"],
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-restore-last-session",
+        ],
         user_agent=(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -182,12 +185,23 @@ def fetch_json(url: str, retries: int = 3) -> dict:
 
 def close_browser():
     global _playwright, _context, _page
-    try:
-        if _page and not _page.is_closed():
+    if _page and not _page.is_closed():
+        try:
+            # Navigate away so Chromium can flush its session state cleanly.
+            _page.goto("about:blank", timeout=5000)
+        except Exception:
+            pass
+        try:
             _page.close()
-        if _context:
+        except Exception as e:
+            logger.warning("Error closing browser page: %s", e)
+    if _context:
+        try:
             _context.close()
-        if _playwright:
+        except Exception as e:
+            logger.warning("Error closing browser context: %s", e)
+    if _playwright:
+        try:
             _playwright.stop()
-    except Exception as e:
-        logger.warning("Error closing browser: %s", e)
+        except Exception as e:
+            logger.warning("Error stopping Playwright: %s", e)

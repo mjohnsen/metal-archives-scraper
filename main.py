@@ -4,13 +4,17 @@ from __future__ import annotations
 import argparse
 import logging
 import random
+import shutil
 import time
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from metal_archives_scraper import browser, scraper, spreadsheet
 from metal_archives_scraper.config import (
     ARTIST_PAGE_INTERVAL_MIN,
     ARTIST_PAGE_INTERVAL_SECONDS,
+    BACKUP_INTERVAL,
     LOG_DIR,
     QUERY_INTERVAL_MIN,
     QUERY_INTERVAL_SECONDS,
@@ -22,7 +26,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / "scraper.log"),
+        RotatingFileHandler(LOG_DIR / "scraper.log", maxBytes=5_000_000, backupCount=3),
         logging.StreamHandler(),
     ],
 )
@@ -30,6 +34,20 @@ logger = logging.getLogger(__name__)
 
 
 _TYPE_PRECEDENCE = ["Full-length", "EP", "Single", "Live album", "Compilation", "Demo"]
+
+
+def _save_periodic_backup(path: str) -> None:
+    """Copy the current spreadsheet to a timestamped file in a backups/ subdirectory."""
+    src = Path(path)
+    backup_dir = src.parent / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dst = backup_dir / f"{src.stem}_{timestamp}{src.suffix}"
+    try:
+        shutil.copy2(src, dst)
+        logger.info("Periodic backup saved to %s", dst)
+    except Exception as e:
+        logger.warning("Periodic backup failed: %s", e)
 
 
 def _pick_best_by_type(candidates: list) -> dict:
@@ -307,9 +325,27 @@ def main():
         default=None,
         help="Path to collection spreadsheet (overrides saved config).",
     )
+    parser.add_argument(
+        "--find-duplicates",
+        action="store_true",
+        help="Print a report of duplicate (Artist, Release) rows and exit.",
+    )
     args = parser.parse_args()
 
     path = args.spreadsheet if args.spreadsheet else get_spreadsheet_path()
+
+    if args.find_duplicates:
+        wb = spreadsheet.open_workbook(path)
+        ws_collection = wb.worksheets[0]
+        dupes = spreadsheet.find_duplicate_rows(ws_collection)
+        if not dupes:
+            print("No duplicate rows found.")
+        else:
+            print(f"Found {len(dupes)} duplicate (Artist, Release) pair(s):\n")
+            for artist, release, rows in dupes:
+                row_str = ", ".join(str(r) for r in rows)
+                print(f"  {artist} — {release}  (rows {row_str})")
+        return
     logger.info("Using spreadsheet: %s", path)
 
     wb = spreadsheet.open_workbook(path)
@@ -324,6 +360,8 @@ def main():
 
     query_throttle = AdaptiveThrottle(QUERY_INTERVAL_SECONDS, QUERY_INTERVAL_MIN)
     artist_throttle = AdaptiveThrottle(ARTIST_PAGE_INTERVAL_SECONDS, ARTIST_PAGE_INTERVAL_MIN)
+
+    artists_processed = 0
 
     try:
         while True:
@@ -347,6 +385,10 @@ def main():
                 query_throttle=query_throttle,
                 artist_throttle=artist_throttle,
             )
+
+            artists_processed += 1
+            if BACKUP_INTERVAL > 0 and artists_processed % BACKUP_INTERVAL == 0:
+                _save_periodic_backup(path)
 
     except RuntimeError as e:
         logger.critical("Fatal browser error — stopping scraper: %s", e)
