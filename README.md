@@ -47,6 +47,13 @@ pip3 install -r requirements.txt
 playwright install chromium
 ```
 
+On Windows, use `pip` and `python` instead of `pip3`/`python3`, and run the Playwright install step through Python to ensure it uses the right installation:
+
+```bat
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
 ## Running
 
 ```bash
