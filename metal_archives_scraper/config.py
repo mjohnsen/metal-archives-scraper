@@ -25,7 +25,7 @@ ARTIST_PAGE_INTERVAL_SECONDS: float = _cfg_float("artist_page_interval_seconds",
 ARTIST_PAGE_INTERVAL_MIN: float = _cfg_float("artist_page_interval_min", 4.0)
 FUZZY_MATCH_THRESHOLD: int = int(_cfg_float("fuzzy_match_threshold", 80))
 # How many artists to process between periodic backups (0 = disabled)
-BACKUP_INTERVAL: int = int(_cfg_float("backup_interval", 25))
+BACKUP_INTERVAL: int = int(_cfg_float("backup_interval", 50))
 
 
 def save_config(cfg: dict):

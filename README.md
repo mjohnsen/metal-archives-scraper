@@ -81,6 +81,31 @@ Optional settings can be set in `scraper_config.json` in the project root:
 
 The rate limiter starts at `*_seconds` and adaptively decreases toward `*_min` after sustained successful requests. `fuzzy_match_threshold` (0–100) controls how closely a release title must match a Metal Archives discography entry to be considered a match. Lower values match more aggressively but increase false positives.
 
+## Utilities
+
+### Finding duplicate rows
+
+If your spreadsheet has the same (Artist, Release) pair on more than one row, the scraper will process it correctly, but you may want to clean up the duplicates manually. Run:
+
+```bash
+python3 main.py --find-duplicates
+```
+
+This scans the collection sheet and prints a report of every duplicate pair and the spreadsheet row numbers where each copy appears, then exits without starting the browser or making any network requests. Example output:
+
+```
+Found 2 duplicate (Artist, Release) pair(s):
+
+  Pharaoh — After the Fire  (rows 142, 3847)
+  Withering Surface — Exit Plan  (rows 89, 10234)
+```
+
+The `--spreadsheet` flag works alongside `--find-duplicates` if you want to check a file other than the one saved in `scraper_config.json`:
+
+```bash
+python3 main.py --spreadsheet /path/to/collection.xlsx --find-duplicates
+```
+
 ## Limitations
 
 **Requires a visible browser.** The scraper cannot run headless. Cloudflare will block headless Chromium, so the browser window must remain open. The persistent browser profile (`browser_data/`) stores cookies and session state across runs, which reduces but does not eliminate Cloudflare challenges.

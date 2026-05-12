@@ -325,9 +325,27 @@ def main():
         default=None,
         help="Path to collection spreadsheet (overrides saved config).",
     )
+    parser.add_argument(
+        "--find-duplicates",
+        action="store_true",
+        help="Print a report of duplicate (Artist, Release) rows and exit.",
+    )
     args = parser.parse_args()
 
     path = args.spreadsheet if args.spreadsheet else get_spreadsheet_path()
+
+    if args.find_duplicates:
+        wb = spreadsheet.open_workbook(path)
+        ws_collection = wb.worksheets[0]
+        dupes = spreadsheet.find_duplicate_rows(ws_collection)
+        if not dupes:
+            print("No duplicate rows found.")
+        else:
+            print(f"Found {len(dupes)} duplicate (Artist, Release) pair(s):\n")
+            for artist, release, rows in dupes:
+                row_str = ", ".join(str(r) for r in rows)
+                print(f"  {artist} — {release}  (rows {row_str})")
+        return
     logger.info("Using spreadsheet: %s", path)
 
     wb = spreadsheet.open_workbook(path)

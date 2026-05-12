@@ -39,6 +39,7 @@ from metal_archives_scraper.spreadsheet import (
     ensure_not_found_sheet,
     ensure_review_sheet,
     expand_st_titles,
+    find_duplicate_rows,
     get_unsearched_artists,
     open_workbook,
     pick_random_artist,
@@ -393,6 +394,80 @@ class TestPickRandomArtist:
 
 
 # ---------------------------------------------------------------------------
+# find_duplicate_rows
+# ---------------------------------------------------------------------------
+
+class TestFindDuplicateRows:
+    def _make_ws(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_SEARCHED)
+        ws = wb.active
+        ws.cell(row=2, column=1, value="Pharaoh")
+        ws.cell(row=2, column=2, value="After the Fire")
+        ws.cell(row=3, column=1, value="Iced Earth")
+        ws.cell(row=3, column=2, value="Framing Armageddon")
+        return ws
+
+    def test_returns_empty_when_no_duplicates(self):
+        ws = self._make_ws()
+        assert find_duplicate_rows(ws) == []
+
+    def test_detects_duplicate_pair(self):
+        ws = self._make_ws()
+        ws.cell(row=4, column=1, value="Pharaoh")
+        ws.cell(row=4, column=2, value="After the Fire")
+        dupes = find_duplicate_rows(ws)
+        assert len(dupes) == 1
+        artist, release, rows = dupes[0]
+        assert artist == "Pharaoh"
+        assert release == "After the Fire"
+        assert sorted(rows) == [2, 4]
+
+    def test_reports_all_row_numbers_for_triplicate(self):
+        ws = self._make_ws()
+        ws.cell(row=4, column=1, value="Pharaoh")
+        ws.cell(row=4, column=2, value="After the Fire")
+        ws.cell(row=5, column=1, value="Pharaoh")
+        ws.cell(row=5, column=2, value="After the Fire")
+        artist, release, rows = find_duplicate_rows(ws)[0]
+        assert sorted(rows) == [2, 4, 5]
+
+    def test_does_not_flag_same_artist_different_release(self):
+        ws = self._make_ws()
+        ws.cell(row=4, column=1, value="Pharaoh")
+        ws.cell(row=4, column=2, value="The Longest Night")
+        assert find_duplicate_rows(ws) == []
+
+    def test_result_is_sorted_by_artist_then_release(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE)
+        ws = wb.active
+        for r, (a, rel) in enumerate([
+            ("Iced Earth", "Framing Armageddon"),
+            ("Pharaoh", "After the Fire"),
+            ("Iced Earth", "Framing Armageddon"),
+            ("Pharaoh", "After the Fire"),
+        ], start=2):
+            ws.cell(row=r, column=1, value=a)
+            ws.cell(row=r, column=2, value=rel)
+        dupes = find_duplicate_rows(ws)
+        assert [d[0] for d in dupes] == ["Iced Earth", "Pharaoh"]
+
+    def test_sort_is_case_insensitive(self):
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE)
+        ws = wb.active
+        for r, (a, rel) in enumerate([
+            ("zz Top", "Eliminator"),
+            ("Accept", "Balls to the Wall"),
+            ("zz Top", "Eliminator"),
+            ("Accept", "Balls to the Wall"),
+        ], start=2):
+            ws.cell(row=r, column=1, value=a)
+            ws.cell(row=r, column=2, value=rel)
+        dupes = find_duplicate_rows(ws)
+        assert dupes[0][0] == "Accept"
+        assert dupes[1][0] == "zz Top"
+
+
+# ---------------------------------------------------------------------------
 # update_release_row
 # ---------------------------------------------------------------------------
 
@@ -506,6 +581,43 @@ class TestUpdateReleaseRow:
         ws = self._make_ws()
         # Should not raise
         update_release_row(ws, "Nonexistent", "Album", searched=True, found=False)
+
+    def test_updates_unsearched_duplicate_when_later_row_is_already_searched(self):
+        # Regression: _get_row_index used a dict with last-row-wins semantics.
+        # If an already-searched duplicate appeared after the unsearched row,
+        # update_release_row would write to the searched row (no-op) and leave
+        # the unsearched duplicate permanently stuck.
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_SEARCHED, C_FOUND)
+        ws = wb.active
+        # Row 2: unsearched duplicate (the one that must be updated)
+        ws.cell(row=2, column=1, value="Withering Surface")
+        ws.cell(row=2, column=2, value="Exit Plan")
+        # Row 3: already-searched duplicate (appears later — was the last-wins target)
+        ws.cell(row=3, column=1, value="Withering Surface")
+        ws.cell(row=3, column=2, value="Exit Plan")
+        ws.cell(row=3, column=3, value=True)   # Searched
+        ws.cell(row=3, column=4, value=True)   # Found
+
+        update_release_row(ws, "Withering Surface", "Exit Plan", searched=True, found=False)
+
+        assert ws.cell(row=2, column=3).value is True, (
+            "Unsearched duplicate (row 2) was not marked — update went to the already-searched row instead"
+        )
+
+    def test_updates_all_unsearched_duplicates(self):
+        # When every duplicate is unsearched, all of them must be marked so
+        # none remain visible to get_unsearched_artists.
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_SEARCHED, C_FOUND)
+        ws = wb.active
+        ws.cell(row=2, column=1, value="Withering Surface")
+        ws.cell(row=2, column=2, value="Exit Plan")
+        ws.cell(row=3, column=1, value="Withering Surface")
+        ws.cell(row=3, column=2, value="Exit Plan")
+
+        update_release_row(ws, "Withering Surface", "Exit Plan", searched=True, found=False)
+
+        assert ws.cell(row=2, column=3).value is True
+        assert ws.cell(row=3, column=3).value is True
 
 
 # ---------------------------------------------------------------------------
@@ -768,6 +880,47 @@ class TestExpandStTitles:
         expand_st_titles(ws_collection, ws_review, "Pharaoh", ["s/t"])
         # Other Band's row should be untouched
         assert ws_collection.cell(row=3, column=2).value == "s/t"
+
+    def test_update_release_row_works_after_st_rename_with_stale_cache(self):
+        # Regression: expand_st_titles modifies the Release cell without
+        # invalidating _row_index_cache. A second artist with s/t could have
+        # its cache entry built under ("Artist", "s/t") before the rename,
+        # so the subsequent update_release_row("Artist", "Artist") lookup
+        # would miss and silently skip writing the Searched flag — causing
+        # the artist to loop forever as "unsearched".
+        wb = _wb_with_headers(C_ARTIST, C_RELEASE, C_SEARCHED, C_FOUND)
+        ws_collection = wb.active
+        # Artist 1 (non-s/t) — processed first, which populates the cache
+        ws_collection.cell(row=2, column=1, value="Pharaoh")
+        ws_collection.cell(row=2, column=2, value="After the Fire")
+        # Artist 2 (s/t) — cache is built before expand_st_titles renames it
+        ws_collection.cell(row=3, column=1, value="Black Funeral")
+        ws_collection.cell(row=3, column=2, value="s/t")
+
+        wb.create_sheet("Review")
+        ws_review = wb["Review"]
+        for i, col in enumerate(
+            [COL_REVIEW_ARTIST, COL_REVIEW_RELEASE, COL_REVIEW_ISSUE, COL_REVIEW_MA_URLS],
+            start=1,
+        ):
+            ws_review.cell(row=1, column=i, value=col)
+
+        # Trigger cache build (simulates first artist's update_release_row)
+        update_release_row(ws_collection, "Pharaoh", "After the Fire",
+                           searched=True, found=True)
+
+        # Now expand s/t for artist 2 — this renames the cell and must clear the cache
+        expand_st_titles(ws_collection, ws_review, "Black Funeral", ["s/t"])
+
+        # update_release_row must find the row even though cache was stale
+        update_release_row(ws_collection, "Black Funeral", "Black Funeral",
+                           searched=True, found=False)
+
+        searched = _col_val(ws_collection, 3, C_SEARCHED)
+        assert searched is True, (
+            "Searched flag was not written — expand_st_titles likely failed to "
+            "invalidate _row_index_cache after renaming the s/t cell"
+        )
 
 
 # ---------------------------------------------------------------------------

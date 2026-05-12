@@ -49,7 +49,7 @@ _STATS_MAX_ROWS = 50000
 # In production a worksheet object lives for the entire session, so these are
 # populated once and never stale.
 _col_map_cache: dict[int, dict[str, int]] = {}
-_row_index_cache: dict[int, dict[tuple[str, str], int]] = {}
+_row_index_cache: dict[int, dict[tuple[str, str], list[int]]] = {}
 
 COLLECTION_REQUIRED = [C_ARTIST, C_RELEASE]
 # Inserted in this exact order immediately after Artist/Release
@@ -87,19 +87,19 @@ def _get_col_map(ws: Worksheet) -> dict[str, int]:
     return _col_map_cache[ws_id]
 
 
-def _get_row_index(ws: Worksheet) -> dict[tuple[str, str], int]:
+def _get_row_index(ws: Worksheet) -> dict[tuple[str, str], list[int]]:
     ws_id = id(ws)
     if ws_id not in _row_index_cache:
         col_map = _get_col_map(ws)
         artist_col = col_map.get(C_ARTIST)
         release_col = col_map.get(C_RELEASE)
-        index: dict[tuple[str, str], int] = {}
+        index: dict[tuple[str, str], list[int]] = {}
         if artist_col and release_col:
             for row in ws.iter_rows(min_row=2):
                 artist = row[artist_col - 1].value
                 release = row[release_col - 1].value
                 if artist and release:
-                    index[(str(artist), str(release))] = row[0].row
+                    index.setdefault((str(artist), str(release)), []).append(row[0].row)
         _row_index_cache[ws_id] = index
     return _row_index_cache[ws_id]
 
@@ -225,6 +225,22 @@ def get_unsearched_artists(ws: Worksheet) -> dict[str, list[str]]:
     return result
 
 
+def find_duplicate_rows(ws: Worksheet) -> list[tuple[str, str, list[int]]]:
+    """Return one entry per (artist, release) pair that appears more than once.
+
+    Each entry is (artist_name, release_title, [row_numbers]), sorted
+    alphabetically by artist then release.
+    """
+    index = _get_row_index(ws)
+    dupes = [
+        (artist, release, rows)
+        for (artist, release), rows in index.items()
+        if len(rows) > 1
+    ]
+    dupes.sort(key=lambda x: (x[0].casefold(), x[1].casefold()))
+    return dupes
+
+
 def pick_random_artist(ws: Worksheet) -> tuple[str, list[str]] | tuple[None, None]:
     unsearched = get_unsearched_artists(ws)
     if not unsearched:
@@ -247,31 +263,9 @@ def update_release_row(
     needs_review: bool = False,
 ):
     col_map = _get_col_map(ws)
-    row_num = _get_row_index(ws).get((artist_name, release_title))
-    if row_num is None:
+    row_nums = _get_row_index(ws).get((artist_name, release_title))
+    if not row_nums:
         return
-
-    def _set(col_name, value):
-        col = col_map.get(col_name)
-        if col and value is not None:
-            ws.cell(row=row_num, column=col, value=value)
-
-    _set(C_SEARCHED, searched)
-    _set(C_FOUND, found)
-    if artist_url:
-        _set(C_MA_ARTIST_URL, artist_url)
-    if release_url:
-        _set(C_MA_RELEASE_URL, release_url)
-    if needs_review:
-        _set(C_REVIEW_FLAG, True)
-
-    # Only populate year/genre/type when the cell is currently empty
-    def _set_if_empty(col_name, value):
-        col = col_map.get(col_name)
-        if col and value:
-            cell = ws.cell(row=row_num, column=col)
-            if not cell.value:
-                cell.value = value
 
     year_val = year
     if year:
@@ -279,9 +273,33 @@ def update_release_row(
             year_val = int(year)
         except (ValueError, TypeError):
             pass
-    _set_if_empty(C_YEAR, year_val)
-    _set_if_empty(C_GENRE, genre)
-    _set_if_empty(C_TYPE, release_type)
+
+    for row_num in row_nums:
+        def _set(col_name, value, _row=row_num):
+            col = col_map.get(col_name)
+            if col and value is not None:
+                ws.cell(row=_row, column=col, value=value)
+
+        _set(C_SEARCHED, searched)
+        _set(C_FOUND, found)
+        if artist_url:
+            _set(C_MA_ARTIST_URL, artist_url)
+        if release_url:
+            _set(C_MA_RELEASE_URL, release_url)
+        if needs_review:
+            _set(C_REVIEW_FLAG, True)
+
+        # Only populate year/genre/type when the cell is currently empty
+        def _set_if_empty(col_name, value, _row=row_num):
+            col = col_map.get(col_name)
+            if col and value:
+                cell = ws.cell(row=_row, column=col)
+                if not cell.value:
+                    cell.value = value
+
+        _set_if_empty(C_YEAR, year_val)
+        _set_if_empty(C_GENRE, genre)
+        _set_if_empty(C_TYPE, release_type)
 
 
 _DISAMBIG_FIELDS = ("country", "location", "formed_in", "genre", "years_active")
@@ -403,6 +421,7 @@ def expand_st_titles(
     updated: list[str] = []
     for title in release_titles:
         if title.strip().lower() == "s/t":
+            renamed = False
             for row in ws_collection.iter_rows(min_row=2):
                 row_artist = row[artist_col - 1].value if artist_col else None
                 row_release = row[release_col - 1].value if release_col else None
@@ -411,6 +430,9 @@ def expand_st_titles(
                     and str(row_release).strip().lower() == "s/t"
                 ):
                     row[release_col - 1].value = artist_name
+                    renamed = True
+            if renamed:
+                _row_index_cache.pop(id(ws_collection), None)
             add_review_entry(
                 ws_review, artist_name, artist_name,
                 "s/t changed to artist name", [],
