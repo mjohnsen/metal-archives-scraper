@@ -32,11 +32,12 @@ The scraper reads from and writes to a single `.xlsx` file. The first sheet is y
 | Found | No | Set to `True` if a match was found, `False` otherwise |
 | Needs Review | No | Set to `True` for ambiguous matches |
 
-The scraper also creates (or appends to) three additional sheets:
+The scraper also creates (or appends to) three additional sheets, and maintains a fourth summary sheet:
 
 - **Artists** — one row per unique Metal Archives band page, with name, location, and a JSON blob of band metadata
 - **Not Found** — releases that returned no search results
 - **Review** — releases that need human attention (partial fuzzy matches, multiple bands with the same name, releases that appear under multiple titles in the discography, etc.)
+- **Statistics** — a summary dashboard rebuilt on every save, showing total and unique counts, completion percentage, found rate, a breakdown by release type, metadata coverage, and row counts for the other sheets
 
 ## Setup
 
